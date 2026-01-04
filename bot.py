@@ -276,5 +276,5 @@ def handle(message):
     except Exception:
         pass
 
-print("Bot berjalan (RDAP / ICANN-style, tanpa Digger)...")
+print("Bot berjalan...")
 bot.infinity_polling()
