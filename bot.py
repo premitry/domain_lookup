@@ -2,7 +2,9 @@ import os, re, time, random, json, sys
 from datetime import datetime
 from pathlib import Path
 import requests
-import telebot
+import telebot=
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 
 def load_config(cfg_path: Path) -> dict:
     if cfg_path.exists():
@@ -54,6 +56,83 @@ API_TOKEN = get_api_token()
 bot = telebot.TeleBot(API_TOKEN)
 session = requests.Session()
 
+# --- BROADCAST / ADMIN ---
+CFG_PATH = Path(__file__).with_name("config.json")
+
+def _cfg():
+    # reload setiap kali supaya perubahan config langsung kebaca
+    return load_config(CFG_PATH) if 'load_config' in globals() else {}
+
+def _save(cfg: dict):
+    if 'save_config' in globals():
+        save_config(CFG_PATH, cfg)
+    else:
+        CFG_PATH.write_text(__import__("json").dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+def get_admin_ids():
+    cfg = _cfg()
+    admins = cfg.get("admin_ids") or cfg.get("admins") or []
+    out = []
+    for x in admins:
+        try:
+            out.append(int(x))
+        except Exception:
+            pass
+    # simpan balik normalisasi key "admin_ids"
+    if cfg.get("admin_ids") != out:
+        cfg["admin_ids"] = out
+        _save(cfg)
+    return out
+
+def is_admin(user_id: int) -> bool:
+    return int(user_id) in set(get_admin_ids())
+
+def register_user(chat_id: int):
+    cfg = _cfg()
+    users = cfg.get("users") or []
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return
+    if chat_id not in users:
+        users.append(chat_id)
+        cfg["users"] = users
+        _save(cfg)
+
+def add_admin_id(user_id: int):
+    cfg = _cfg()
+    admins = cfg.get("admin_ids") or []
+    uid = int(user_id)
+    if uid not in admins:
+        admins.append(uid)
+    cfg["admin_ids"] = admins
+    _save(cfg)
+
+def del_admin_id(user_id: int):
+    cfg = _cfg()
+    admins = cfg.get("admin_ids") or []
+    uid = int(user_id)
+    if uid in admins:
+        admins.remove(uid)
+    cfg["admin_ids"] = admins
+    _save(cfg)
+
+def remove_user(chat_id: int):
+    cfg = _cfg()
+    users = cfg.get("users") or []
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return
+    if chat_id in users:
+        users.remove(chat_id)
+        cfg["users"] = users
+        _save(cfg)
+
+PENDING_BROADCAST = {}
+
+
+>>>>>>> 9d4966e (Add admin broadcast features and update README)
 DOMAIN_RE = re.compile(r"""(?ix)
 (?:https?://)?(?:www\.)?
 ([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)
@@ -210,9 +289,199 @@ def send_welcome(message):
         parse_mode="Markdown"
     )
 
+<<<<<<< HEAD
 @bot.message_handler(func=lambda message: True)
 def handle(message):
     domains = extract_domains((message.text or "").strip())
+=======
+
+
+# --- ADMIN COMMANDS ---
+@bot.message_handler(commands=["myid"])
+def cmd_myid(message):
+    bot.reply_to(
+        message,
+        f"🆔 ID kamu: `{message.from_user.id}`\n💬 Chat ID: `{message.chat.id}`",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["admins"])
+def cmd_admins(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Kamu bukan admin.")
+        return
+    admins = get_admin_ids()
+    bot.reply_to(message, "👑 Admin IDs:\n" + "\n".join([f"- {a}" for a in admins]))
+
+@bot.message_handler(commands=["setadmin"])
+def cmd_setadmin(message):
+    # bootstrap: kalau admin_ids kosong, siapa pun boleh set admin pertama
+    admins = get_admin_ids()
+    if admins:
+        bot.reply_to(message, "Admin sudah ada. Gunakan /addadmin <id> (admin only).")
+        return
+    add_admin_id(message.from_user.id)
+    bot.reply_to(message, f"✅ Kamu jadi admin pertama.\nID: `{message.from_user.id}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["addadmin"])
+def cmd_addadmin(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Kamu bukan admin.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        bot.reply_to(message, "Format: /addadmin <id>\nContoh: /addadmin 12345678")
+        return
+    uid = int(parts[1].strip())
+    add_admin_id(uid)
+    bot.reply_to(message, f"✅ Admin ditambahkan: `{uid}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["deladmin"])
+def cmd_deladmin(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Kamu bukan admin.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        bot.reply_to(message, "Format: /deladmin <id>\nContoh: /deladmin 12345678")
+        return
+    uid = int(parts[1].strip())
+    admins = get_admin_ids()
+    if uid not in admins:
+        bot.reply_to(message, f"⚠️ ID `{uid}` bukan admin.", parse_mode="Markdown")
+        return
+    if len(admins) <= 1:
+        bot.reply_to(message, "⚠️ Tidak bisa hapus admin terakhir.")
+        return
+    del_admin_id(uid)
+    bot.reply_to(message, f"✅ Admin dihapus: `{uid}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Kamu bukan admin.")
+        return
+    cfg = _cfg()
+    users = cfg.get("users") or []
+    admins = get_admin_ids()
+    bot.reply_to(
+        message,
+        f"📊 Stats\n\n👥 Users tersimpan: {len(users)}\n👑 Admin: {len(admins)}",
+    )
+
+@bot.message_handler(commands=["bc"])
+def cmd_broadcast(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Kamu bukan admin.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Format: /bc <pesan>\nContoh: /bc Halo semua!")
+        return
+
+    msg = parts[1].strip()
+    cfg = _cfg()
+    users = cfg.get("users") or []
+    if not users:
+        bot.reply_to(message, "Belum ada user tersimpan (belum ada yang chat bot).")
+        return
+
+    # tombol konfirmasi
+    key = f"{message.from_user.id}:{message.chat.id}:{message.message_id}"
+    PENDING_BROADCAST[key] = {"msg": msg, "users": list(users)}
+
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("✅ Kirim", callback_data=f"bc_send|{key}"),
+        InlineKeyboardButton("❌ Batal", callback_data=f"bc_cancel|{key}")
+    )
+
+    preview = msg if len(msg) <= 800 else (msg[:800] + "…")
+    bot.reply_to(
+        message,
+        f"📣 Konfirmasi broadcast ke **{len(users)}** chat:\n\n{preview}",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("bc_"))
+def cb_broadcast(call):
+    try:
+        action, key = call.data.split("|", 1)
+    except Exception:
+        bot.answer_callback_query(call.id, "Invalid data")
+        return
+
+    # hanya admin pemilik yang bisa konfirmasi
+    try:
+        admin_id = int(key.split(":", 1)[0])
+    except Exception:
+        bot.answer_callback_query(call.id, "Invalid key")
+        return
+
+    if call.from_user.id != admin_id:
+        bot.answer_callback_query(call.id, "❌ Bukan untuk kamu.")
+        return
+
+    data = PENDING_BROADCAST.get(key)
+    if not data:
+        bot.answer_callback_query(call.id, "⚠️ Broadcast sudah tidak aktif.")
+        return
+
+    if action == "bc_cancel":
+        PENDING_BROADCAST.pop(key, None)
+        try:
+            bot.edit_message_text("❌ Broadcast dibatalkan.", call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Dibatalkan")
+        return
+
+    if action != "bc_send":
+        bot.answer_callback_query(call.id, "Unknown action")
+        return
+
+    # kirim broadcast
+    users = data.get("users") or []
+    msg = data.get("msg") or ""
+    ok = 0
+    fail = 0
+
+    try:
+        bot.edit_message_text(f"📣 Mengirim broadcast ke {len(users)} chat...", call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+    for cid in list(users):
+        try:
+            bot.send_message(cid, msg)
+            ok += 1
+        except Exception:
+            fail += 1
+            remove_user(cid)
+
+    PENDING_BROADCAST.pop(key, None)
+
+    try:
+        bot.edit_message_text(
+            f"✅ Broadcast selesai.\nTerkirim: {ok}\nGagal: {fail}",
+            call.message.chat.id,
+            call.message.message_id
+        )
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id, "Selesai ✅")
+
+@bot.message_handler(func=lambda message: True)
+def handle(message):
+    text = (message.text or "").strip()
+    register_user(message.chat.id)
+    if text.startswith("/"):
+        return
+    domains = extract_domains(text)
+>>>>>>> 9d4966e (Add admin broadcast features and update README)
     if not domains:
         bot.reply_to(message, "Format domain salah. Contoh: `interhost.ltd`", parse_mode="Markdown")
         return

@@ -38,7 +38,28 @@ sudo apt install -y python3 python3-pip
 ## 3) Install dependencies (requirements)
 ```
 pip3 install -r requirements.txt
+<<<<<<< HEAD
 ```
 ## 5) Jalankan bot
 ```
 python3 bot.py
+=======
+
+
+## Admin & Broadcast
+
+Perintah admin (hanya bisa dipakai admin):
+- `/setadmin` — set admin pertama (hanya jika belum ada admin)
+- `/admins` — lihat daftar admin
+- `/addadmin <id>` — tambah admin
+- `/deladmin <id>` — hapus admin (tidak bisa hapus admin terakhir)
+- `/stats` — lihat jumlah user tersimpan
+- `/bc <pesan>` — broadcast ke semua user (ada tombol konfirmasi ✅/❌)
+
+Perintah user:
+- Kirim domain (single/bulk) seperti biasa.
+- `/myid` — lihat ID kamu (untuk minta dijadikan admin)
+
+Catatan:
+- User yang pernah chat bot akan tersimpan otomatis untuk kebutuhan broadcast.
+- Broadcast hanya bisa dilakukan admin dan wajib konfirmasi tombol sebelum terkirim.
