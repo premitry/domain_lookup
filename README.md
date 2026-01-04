@@ -4,9 +4,14 @@ Bot Telegram untuk cek domain secara **bulk** menggunakan **RDAP** (gaya ICANN l
 
 - Domain **.id** memakai RDAP PANDI
 - Domain selain .id memakai `rdap.org`
-- Mode bulk: bot **edit 1 pesan** (tidak spam chat) + ada jarak 1 baris antar hasil
+- Mode bulk: 
+Enter/newline
+Spasi
+Koma (,)
+Campuran semua
+Boleh kirim URL juga (mis. https://www.cloudflare.com) → yang diambil domainnya cloudflare.com
+Yang penting: ada format domain nama.tld (ada titik).
 - Auto baca `config.json`. Kalau token kosong dan dijalankan interaktif, bot akan minta token lalu menyimpan otomatis.
-
 ## Fitur
 - Kirim banyak domain dalam 1 pesan (pisah newline/spasi/koma/URL).
 - Output ringkas: AVAILABLE / REGISTERED + Expired & Registrar.
