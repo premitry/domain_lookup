@@ -17,7 +17,7 @@ Bot Telegram untuk cek domain secara **bulk** menggunakan **RDAP** (ICANN lookup
 - Catatan: Telegram edit message ada limit karakter (~4096). Kalau hasil terlalu panjang, output bisa dipotong.
 
 ## Struktur
-- `domain_rdap.py` — script bot
+- `bot.py` — script bot
 - `requirements.txt` — dependency
 - `config.example.json` — contoh config
 - `config.json` — config asli 
@@ -41,4 +41,4 @@ pip3 install -r requirements.txt
 ```
 ## 5) Jalankan bot
 ```
-python3 domain_rdap.py
+python3 bot.py
