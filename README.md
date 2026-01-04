@@ -43,9 +43,8 @@ pip3 install -r requirements.txt
 ## 5) Jalankan bot
 ```
 python3 bot.py
-=======
 
-
+```
 ## Admin & Broadcast
 
 Perintah admin (hanya bisa dipakai admin):
