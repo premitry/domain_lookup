@@ -11,6 +11,7 @@ Bot Telegram untuk cek domain secara **bulk** menggunakan **RDAP** (ICANN lookup
 - Output ringkas: AVAILABLE / REGISTERED + Expired & Registrar.
 - Retry & backoff saat kena rate limit.
 - Token via `config.json` atau env `BOT_TOKEN`.
+- Admin & Broadcast
 
 ## Limit Bulk
 - Maksimal **25 domain** per 1 pesan (lebih dari 25 akan dipotong, hanya 25 pertama yang diproses).
@@ -38,7 +39,6 @@ sudo apt install -y python3 python3-pip
 ## 3) Install dependencies (requirements)
 ```
 pip3 install -r requirements.txt
-<<<<<<< HEAD
 ```
 ## 5) Jalankan bot
 ```
