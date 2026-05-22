@@ -1,0 +1,15 @@
+name = "domain-lookup-bot"
+main = "worker.js"
+compatibility_date = "2026-05-09"
+
+# Buat KV dulu:
+# wrangler kv namespace create BOT_KV
+# Lalu isi id hasilnya di bawah ini.
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "ee96ca4bbe7c4760953d95fdf98317ff"
+
+[vars]
+# Opsional: admin awal, pisahkan dengan koma. Bisa kosong lalu pakai /setadmin.
+ADMIN_IDS = ""
+BACKUP_TO_MAIN_ADMIN = "true"
