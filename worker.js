@@ -148,39 +148,84 @@ function isValidDomain(domain) {
   return Boolean(domain && domain.includes('.') && domain.length <= 253 && new RegExp(`^${DOMAIN_RE.source}$`, 'i').test(domain));
 }
 
-function rdapUrl(domain) {
+const IANA_RDAP_BOOTSTRAP = 'https://data.iana.org/rdap/dns.json';
+
+// Ambil peta TLD→server RDAP resmi dari IANA (gratis, tanpa key). Di-cache di KV 7 hari.
+async function getRdapMap(env) {
+  const cached = await kvGetJson(env, 'rdap_bootstrap_map', null);
+  if (cached && typeof cached === 'object' && Object.keys(cached).length) return cached;
+  try {
+    const res = await fetch(IANA_RDAP_BOOTSTRAP, { headers: { accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const map = {};
+    for (const svc of data.services || []) {
+      const tlds = svc[0] || [];
+      const urls = svc[1] || [];
+      const base = (urls.find(u => u.startsWith('https://')) || urls[0] || '').replace(/\/+$/, '');
+      if (!base) continue;
+      for (const tld of tlds) map[String(tld).toLowerCase()] = base;
+    }
+    if (env.BOT_KV && Object.keys(map).length) {
+      await env.BOT_KV.put('rdap_bootstrap_map', JSON.stringify(map), { expirationTtl: 604800 });
+    }
+    return map;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Tembak langsung ke registry resmi; fallback ke rdap.org kalau TLD tak ditemukan.
+async function resolveRdapUrl(env, domain) {
   const d = domain.toLowerCase();
-  return d.endsWith('.id') ? `https://rdap.pandi.id/rdap/domain/${d}` : `https://rdap.org/domain/${d}`;
+  if (d.endsWith('.id')) return `https://rdap.pandi.id/rdap/domain/${d}`;
+  const tld = d.split('.').pop();
+  const map = await getRdapMap(env);
+  const base = map && map[tld];
+  return base ? `${base}/domain/${d}` : `https://rdap.org/domain/${d}`;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function rdapGet(domain, maxRetries = 4) {
+async function rdapGet(env, domain, maxRetries = 3) {
+  // UA browser lengkap: 'Mozilla/5.0' polos sering dianggap bot oleh WAF registry (403).
   const headers = {
     accept: 'application/rdap+json, application/json;q=0.9, */*;q=0.8',
-    'user-agent': 'Mozilla/5.0',
+    'accept-language': 'en-US,en;q=0.9',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   };
+  const url = await resolveRdapUrl(env, domain);
+  let lastCode = 0;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let res;
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 15000);
-      res = await fetch(rdapUrl(domain), { headers, signal: ctrl.signal });
+      res = await fetch(url, { headers, signal: ctrl.signal });
       clearTimeout(timer);
     } catch (_) {
       await sleep(Math.min(8000, (2 ** attempt) * 1000 + 500));
       continue;
     }
+    lastCode = res.status;
     if (res.status === 200) return { code: 200, data: await res.json().catch(() => null), err: null };
     if ([400, 404].includes(res.status)) return { code: res.status, data: null, err: null };
+    // 403/451: registry blokir (WAF/IP), biasanya permanen → langsung fallback, jangan buang waktu retry.
+    if (res.status === 403 || res.status === 451) {
+      return { code: res.status, data: null, err: `HTTP ${res.status} — registry memblokir request` };
+    }
+    // 429/5xx: rate-limit/sesaat → retry dgn backoff.
     if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
       const ra = Number(res.headers.get('retry-after'));
-      await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 8000) : Math.min(8000, (2 ** attempt) * 1000 + 500));
+      await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 3000) : Math.min(3000, (2 ** attempt) * 1000 + 500));
       continue;
     }
     return { code: res.status, data: null, err: `HTTP ${res.status}` };
   }
-  return { code: 429, data: null, err: 'HTTP 429 / rate limited setelah retry' };
+  if (lastCode === 403 || lastCode === 451) {
+    return { code: lastCode, data: null, err: `HTTP ${lastCode} — registry memblokir request (kemungkinan WAF / IP Worker), coba lagi nanti` };
+  }
+  return { code: lastCode || 429, data: null, err: `HTTP ${lastCode || 429} / rate limited setelah retry` };
 }
 
 function formatRdapDate(s) {
@@ -213,16 +258,201 @@ function parseRdapDetails(data) {
   };
 }
 
-async function checkOneDomain(domain, detailed = true) {
-  const { code, data, err } = await rdapGet(domain);
+// ── Fallback IP2WHOIS (dipakai hanya saat RDAP diblokir registry 403/451) ──
+function ip2whoisUrl(domain, key) {
+  return `https://api.ip2whois.com/v2?key=${encodeURIComponent(key)}&domain=${encodeURIComponent(domain)}`;
+}
+
+async function ip2whoisGet(domain, key, maxRetries = 3) {
+  let lastCode = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let res;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      res = await fetch(ip2whoisUrl(domain, key), { headers: { accept: 'application/json' }, signal: ctrl.signal });
+      clearTimeout(timer);
+    } catch (_) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    lastCode = res.status;
+    const data = await res.json().catch(() => null);
+    // IP2WHOIS kadang balikin error dalam body walau HTTP 200 (key salah / kuota habis)
+    if (data && data.error) {
+      return { code: 400, data: null, err: data.error.error_message || `IP2WHOIS err ${data.error.error_code || ''}`.trim() };
+    }
+    if (res.status === 200 && data) return { code: 200, data, err: null };
+    if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    return { code: res.status, data: null, err: `IP2WHOIS HTTP ${res.status}` };
+  }
+  return { code: lastCode || 429, data: null, err: `IP2WHOIS gagal (HTTP ${lastCode || 429})` };
+}
+
+function ip2whoisIsAvailable(data) {
+  return !data.create_date && !data.expire_date && !(data.registrar && data.registrar.name);
+}
+
+function parseIp2whoisDetails(data) {
+  const nsRaw = data.nameservers;
+  const nsList = Array.isArray(nsRaw) ? nsRaw : String(nsRaw || '').split(',').map(s => s.trim());
+  const ns = nsList.filter(Boolean).map(n => `• \`${n}\``).join('\n') || '-';
+  return {
+    registrar: (data.registrar && data.registrar.name) || 'Tidak diketahui',
+    dates: {
+      created: formatRdapDate(data.create_date),
+      expired: formatRdapDate(data.expire_date),
+      updated: formatRdapDate(data.update_date),
+    },
+    ns,
+    status: (Array.isArray(data.status) ? data.status.join(', ') : data.status) || '-',
+    handle: data.domain_id || '-',
+  };
+}
+
+// ── IP geolocation via IP2Location.io (command /ip) ──
+function isValidIp(ip) {
+  const s = String(ip || '').trim();
+  const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) return m.slice(1).every(o => Number(o) <= 255);
+  return s.includes(':') && /^[0-9a-f:]+$/i.test(s) && s.length <= 45; // IPv6 (cek longgar)
+}
+
+function ip2locationUrl(ip, key) {
+  return `https://api.ip2location.io/?key=${encodeURIComponent(key)}&ip=${encodeURIComponent(ip)}`;
+}
+
+async function ip2locationGet(ip, key, maxRetries = 3) {
+  let lastCode = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let res;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      res = await fetch(ip2locationUrl(ip, key), { headers: { accept: 'application/json' }, signal: ctrl.signal });
+      clearTimeout(timer);
+    } catch (_) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    lastCode = res.status;
+    const data = await res.json().catch(() => null);
+    if (data && data.error) {
+      return { code: 400, data: null, err: data.error.error_message || `IP2Location err ${data.error.error_code || ''}`.trim() };
+    }
+    if (res.status === 200 && data) return { code: 200, data, err: null };
+    if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    return { code: res.status, data: null, err: `IP2Location HTTP ${res.status}` };
+  }
+  return { code: lastCode || 429, data: null, err: `IP2Location gagal (HTTP ${lastCode || 429})` };
+}
+
+function formatIpInfo(ip, d) {
+  const loc = [d.city_name, d.region_name, d.country_name].filter(Boolean).join(', ') || '-';
+  const isp = d.isp || d.as || (d.asn ? `AS${d.asn}` : '-');
+  const coords = (d.latitude != null && d.longitude != null) ? `${d.latitude}, ${d.longitude}` : '-';
+  const flag = d.country_code ? ` (${d.country_code})` : '';
+  const proxy = d.is_proxy ? '⚠️ Ya' : 'Tidak';
+  return `🌍 **IP LOOKUP**\n━━━━━━━━━━━━━━━━━━\n📡 **IP:** \`${ip}\`\n\n📍 **Lokasi:** ${loc}${flag}\n🏢 **ISP / AS:** ${isp}\n🕒 **Zona Waktu:** ${d.time_zone || '-'}\n📮 **Kode Pos:** ${d.zip_code || '-'}\n🧭 **Koordinat:** \`${coords}\`\n🕵️ **Proxy/VPN:** ${proxy}`;
+}
+
+// ── Fallback #2: WhoisJSON (whoisjson.com, ~1000/bln, punya boolean `registered`) ──
+async function whoisjsonGet(domain, key, maxRetries = 3) {
+  let lastCode = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let res;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      res = await fetch(`https://whoisjson.com/api/v1/whois?domain=${encodeURIComponent(domain)}`, {
+        headers: { accept: 'application/json', authorization: `Token=${key}` },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+    } catch (_) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    lastCode = res.status;
+    const data = await res.json().catch(() => null);
+    if (data && (data.error || data.message) && typeof data.registered !== 'boolean') {
+      return { code: 400, data: null, err: data.error || data.message };
+    }
+    if (res.status === 200 && data) return { code: 200, data, err: null };
+    if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    return { code: res.status, data: null, err: `WhoisJSON HTTP ${res.status}` };
+  }
+  return { code: lastCode || 429, data: null, err: `WhoisJSON gagal (HTTP ${lastCode || 429})` };
+}
+
+function parseWhoisjsonDetails(data) {
+  const nsList = Array.isArray(data.nameserver) ? data.nameserver : [];
+  const ns = nsList.filter(Boolean).map(n => `• \`${n}\``).join('\n') || '-';
+  const reg = data.registrar || {};
+  return {
+    registrar: reg.name || 'Tidak diketahui',
+    dates: {
+      created: formatRdapDate(data.created),
+      expired: formatRdapDate(data.expires),
+      updated: formatRdapDate(data.changed),
+    },
+    ns,
+    status: (Array.isArray(data.status) ? data.status.join(', ') : data.status) || '-',
+    handle: '-',
+  };
+}
+
+// Rantai fallback saat RDAP diblokir: WhoisJSON dulu (ada boolean `registered`), lalu IP2WHOIS.
+async function fallbackLookup(env, domain) {
+  if (env && env.WHOISJSON_KEY) {
+    const w = await whoisjsonGet(domain, env.WHOISJSON_KEY);
+    if (w.code === 200 && w.data && typeof w.data.registered === 'boolean') {
+      return { available: !w.data.registered, data: w.data, source: 'WHOISJSON' };
+    }
+  }
+  if (env && env.IP2WHOIS_KEY) {
+    const fb = await ip2whoisGet(domain, env.IP2WHOIS_KEY);
+    if (fb.code === 200 && fb.data) {
+      return { available: ip2whoisIsAvailable(fb.data), data: fb.data, source: 'IP2WHOIS' };
+    }
+  }
+  return null;
+}
+
+async function checkOneDomain(env, domain, detailed = true) {
+  let { code, data, err } = await rdapGet(env, domain);
+  let source = 'RDAP';
+
+  // RDAP diblokir/di-rate-limit registry (403/451/429/5xx) → rantai fallback WhoisJSON → IP2WHOIS
+  if (code === 403 || code === 451 || code === 429 || (code >= 500 && code <= 599)) {
+    const fb = await fallbackLookup(env, domain);
+    if (fb) {
+      if (fb.available) { code = 404; data = null; }
+      else { code = 200; data = fb.data; source = fb.source; }
+    } else {
+      err = `${err} | fallback: data tidak tersedia`;
+    }
+  }
+
   if (code === 404) {
     return detailed
-      ? [`✅ **DOMAIN TERSEDIA!**\n\n🌐 Domain: \`${domain}\`\nStatus: Available (RDAP 404)\nGas checkout bang! 🚀`, false]
+      ? [`✅ **DOMAIN TERSEDIA!**\n\n🌐 Domain: \`${domain}\`\nStatus: Available\nGas checkout bang! 🚀`, false]
       : [`✅ \`${domain}\` — AVAILABLE`, false];
   }
   if (code === 400) return [`⚠️ \`${domain}\` — INVALID / BAD REQUEST`, true];
   if (code !== 200 || !data) return [`⚠️ \`${domain}\`\nRDAP error: ${err || `HTTP ${code}`}`, true];
-  const x = parseRdapDetails(data);
+  const x = source === 'IP2WHOIS' ? parseIp2whoisDetails(data)
+    : source === 'WHOISJSON' ? parseWhoisjsonDetails(data)
+    : parseRdapDetails(data);
   if (detailed) {
     return [`❌ **DOMAIN SUDAH TERDAFTAR**\n━━━━━━━━━━━━━━━━━━\n🌐 **Domain:** \`${domain}\`\n🆔 **Handle:** \`${x.handle}\`\n\n🏢 **Registrar:**\n${x.registrar}\n\n📅 **Tanggal:**\nRegister: \`${x.dates.created}\`\nExpired : \`${x.dates.expired}\`\nUpdated : \`${x.dates.updated}\`\n\n🔒 **Status:**\n${x.status}\n\n📡 **Name Servers:**\n${x.ns}`, false];
   }
@@ -270,9 +500,20 @@ async function handleRestoreDocument(env, message) {
 async function handleCommand(env, message, text) {
   const cmd = text.split(/\s+/, 1)[0].toLowerCase();
   if (cmd === '/start' || cmd === '/help') {
-    return reply(env, message, 'Kirim domain untuk cek via RDAP (ICANN-style).\nBisa bulk (pisah spasi/enter/koma).\n\nContoh:\n`google.com\nopenai.com, example.net\nbadras.biz.id`');
+    return reply(env, message, 'Kirim domain untuk cek via RDAP (ICANN-style).\nBisa bulk (pisah spasi/enter/koma).\n\nContoh:\n`google.com\nopenai.com, example.net\nbadras.biz.id`\n\n🌍 Cek lokasi IP: `/ip <alamat_ip>`\nContoh: `/ip 8.8.8.8`');
   }
   if (cmd === '/myid') return reply(env, message, `🆔 ID kamu: \`${message.from.id}\`\n💬 Chat ID: \`${message.chat.id}\``);
+  if (cmd === '/ip') {
+    const ip = (text.split(/\s+/)[1] || '').trim();
+    if (!ip) return reply(env, message, 'Format: /ip <alamat_ip>\nContoh: `/ip 8.8.8.8`');
+    if (!isValidIp(ip)) return reply(env, message, '❌ Alamat IP tidak valid. Contoh: `/ip 8.8.8.8`');
+    const key = env.IP2LOCATION_KEY || env.IP2WHOIS_KEY;
+    if (!key) return reply(env, message, '⚠️ Fitur IP lookup belum aktif (API key belum diset).');
+    const status = await reply(env, message, '🔍 Mencari lokasi IP...');
+    const { code, data, err } = await ip2locationGet(ip, key);
+    const out = (code === 200 && data) ? formatIpInfo(ip, data) : `⚠️ Gagal lookup IP \`${ip}\`\n${err || `HTTP ${code}`}`;
+    return editMessage(env, message.chat.id, status.message_id, out).catch(() => sendMessage(env, message.chat.id, out));
+  }
   if (cmd === '/setadmin') {
     const admins = await getAdmins(env);
     if (admins.length) return reply(env, message, 'Admin sudah ada. Gunakan /addadmin <id> (admin only).');
@@ -376,7 +617,7 @@ async function handleMessage(env, message) {
     const d = domains[0];
     if (!isValidDomain(d)) return reply(env, message, 'Format domain salah.');
     const status = await reply(env, message, '🔍 Checking via RDAP...');
-    const [out] = await checkOneDomain(d, true);
+    const [out] = await checkOneDomain(env, d, true);
     return editMessage(env, message.chat.id, status.message_id, out).catch(() => sendMessage(env, message.chat.id, out));
   }
   const status = await reply(env, message, `🔍 Memproses **${domains.length}** domain via RDAP...`);
@@ -386,7 +627,7 @@ async function handleMessage(env, message) {
     const d = domains[i];
     if (!isValidDomain(d)) { results.push(`⚠️ \`${d}\` — INVALID FORMAT`); errc++; continue; }
     if (i === 0 || (i + 1) % 4 === 0 || i === domains.length - 1) await editMessage(env, message.chat.id, status.message_id, `🔍 Memproses ${i + 1}/${domains.length} ...`).catch(() => {});
-    const [line, isErr] = await checkOneDomain(d, false);
+    const [line, isErr] = await checkOneDomain(env, d, false);
     if (isErr) errc++;
     results.push(line);
     await sleep(250);
