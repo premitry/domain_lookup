@@ -558,12 +558,30 @@ async function handleCommand(env, message, text) {
   }
   if (cmd === '/bc') {
     const msg = text.replace(/^\/bc\s*/i, '').trim();
-    if (!msg) return reply(env, message, 'Format: /bc <pesan>\nContoh: /bc Halo semua!');
+    const photo = (message.photo && message.photo.length) ? message.photo[message.photo.length - 1].file_id : null;
+    const replyMsg = message.reply_to_message;
+    if (!msg && !photo && !replyMsg) {
+      return reply(env, message, 'Format:\n• `/bc <pesan>` — broadcast teks\n• Kirim **FOTO** + caption `/bc <pesan>` — broadcast gambar\n• **Reply** ke sebuah pesan lalu ketik `/bc` — copy pesan itu (foto/teks/video, format utuh)');
+    }
     const users = await getUsers(env);
     if (!users.length) return reply(env, message, 'Belum ada user tersimpan.');
     const key = `${message.from.id}:${message.chat.id}:${message.message_id}`;
-    await kvPutJson(env, `pending:${key}`, { msg, users });
-    return reply(env, message, `📣 Konfirmasi broadcast ke **${users.length}** chat:\n\n${msg.slice(0, 800)}`, {
+    const pending = { msg, users };
+    let label = '📝 teks';
+    if (photo) {
+      pending.photo = photo;
+      // Preserve format caption (bold/emoji): geser offset entity buang prefix "/bc " (bagian depan aja).
+      const afterCmd = text.replace(/^\/bc\s*/i, '');
+      const prefixLen = text.length - afterCmd.length;
+      const ents = (message.caption_entities || []).map(e => ({ ...e, offset: e.offset - prefixLen })).filter(e => e.offset >= 0);
+      if (ents.length) pending.entities = ents;
+      label = '🖼 foto + caption';
+    } else if (replyMsg && !msg) {
+      pending.copyFrom = { chat_id: message.chat.id, message_id: replyMsg.message_id };
+      label = '📋 copy pesan (reply)';
+    }
+    await kvPutJson(env, `pending:${key}`, pending);
+    return reply(env, message, `📣 Konfirmasi broadcast (${label}) ke **${users.length}** chat:\n\n${(msg || '(pesan yang di-reply)').slice(0, 800)}`, {
       reply_markup: { inline_keyboard: [[
         { text: '✅ Kirim', callback_data: `bc_send|${key}` },
         { text: '❌ Batal', callback_data: `bc_cancel|${key}` },
@@ -589,8 +607,20 @@ async function handleCallback(env, call) {
   await editMessage(env, call.message.chat.id, call.message.message_id, `📣 Mengirim broadcast ke ${data.users.length} chat...`).catch(() => {});
   let ok = 0, fail = 0;
   for (const cid of data.users || []) {
-    try { await sendMessage(env, cid, data.msg, { parse_mode: undefined }); ok++; }
-    catch (_) { fail++; const users = (await getUsers(env)).filter(u => u !== Number(cid)); await putUsers(env, users); }
+    try {
+      if (data.photo) {
+        await tg(env, 'sendPhoto', {
+          chat_id: cid, photo: data.photo,
+          caption: data.msg || undefined,
+          caption_entities: (data.entities && data.entities.length) ? data.entities : undefined,
+        });
+      } else if (data.copyFrom) {
+        await tg(env, 'copyMessage', { chat_id: cid, from_chat_id: data.copyFrom.chat_id, message_id: data.copyFrom.message_id });
+      } else {
+        await sendMessage(env, cid, data.msg, { parse_mode: undefined });
+      }
+      ok++;
+    } catch (_) { fail++; const users = (await getUsers(env)).filter(u => u !== Number(cid)); await putUsers(env, users); }
   }
   if (fail) await sendBackup(env, 'remove_user');
   if (env.BOT_KV) await env.BOT_KV.delete(pendingKey);
@@ -600,12 +630,15 @@ async function handleCallback(env, call) {
 
 async function handleMessage(env, message) {
   const text = String(message.text || '').trim();
+  const caption = String(message.caption || '').trim();
   await registerUser(env, message.chat.id);
   if (message.document) {
     const restored = await handleRestoreDocument(env, message);
     if (restored) return restored;
   }
-  if (text.startsWith('/')) return handleCommand(env, message, text);
+  // Command bisa dari teks biasa ATAU caption (mis. foto + "/bc ...").
+  const cmdSource = text.startsWith('/') ? text : (caption.startsWith('/') ? caption : '');
+  if (cmdSource) return handleCommand(env, message, cmdSource);
   if (!text) return;
   let domains = extractDomains(text);
   if (!domains.length) return reply(env, message, 'Format domain salah. Contoh: `interhost.ltd`');
