@@ -821,17 +821,16 @@ async function handleCommand(env, message, text) {
   if (cmd === '/restore') return beginRestore(env, message);
   if (cmd === '/stats') {
     const users = await getUsers(env), admins = await getAdmins(env);
-    const job = await kvGetJson(env, BC_JOB_KEY, null);
-    const bc = job
-      ? `\n\n📣 Broadcast jalan: ${(job.ok || 0) + (job.fail || 0)}/${job.total}\n✅ ${job.ok || 0}  ❌ ${job.fail || 0}  ⏭ sisa ${(job.queue || []).length}\nStop pakai \`/bcstop\``
+    const job = await bcCall(env, '/status').catch(() => null);
+    const bc = (job && job.running)
+      ? `\n\n📣 Broadcast jalan: ${(job.ok || 0) + (job.fail || 0)}/${job.total}\n✅ ${job.ok || 0}  ❌ ${job.fail || 0}  ⏭ sisa ${job.left || 0}\nStop pakai \`/bcstop\``
       : '';
     return reply(env, message, `📊 Stats\n\n👥 Users tersimpan: ${users.length}\n👑 Admin: ${admins.length}${bc}`);
   }
   if (cmd === '/bcstop') {
-    const job = await kvGetJson(env, BC_JOB_KEY, null);
-    if (!job) return reply(env, message, 'Nggak ada broadcast yang jalan.');
-    if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
-    return reply(env, message, `🛑 Broadcast dihentikan.\n✅ Terkirim: *${job.ok || 0}*\n❌ Gagal: *${job.fail || 0}*\n⏭ Sisa dibatalkan: *${(job.queue || []).length}*`);
+    const job = await bcCall(env, '/stop').catch(() => null);
+    if (!job || !job.running) return reply(env, message, 'Nggak ada broadcast yang jalan.');
+    return reply(env, message, `🛑 Broadcast dihentikan.\n✅ Terkirim: *${job.ok || 0}*\n❌ Gagal: *${job.fail || 0}*\n⏭ Sisa dibatalkan: *${job.left || 0}*`);
   }
   if (cmd === '/bc') {
     const msg = text.replace(/^\/bc\s*/i, '').trim();
@@ -869,11 +868,29 @@ async function handleCommand(env, message, text) {
 
 // ── Broadcast bertahap ─────────────────────────────────────────────────────
 // Worker free plan cuma boleh ~50 subrequest per invocation, jadi broadcast ke
-// banyak chat nggak aman dikirim sekali jalan (mentok di tengah, dan sisanya
-// dulu malah kehapus dari daftar user). Sekarang dipecah per batch: batch
-// pertama jalan langsung pas tombol Kirim ditekan, sisanya digilir cron.
+// banyak chat nggak aman dikirim sekali jalan (dulu mentok di tengah, dan
+// sisanya malah kehapus dari daftar user). Sekarang dipecah per batch yang
+// dijalanin Durable Object pakai alarm — tiap alarm = invocation baru, jadi
+// budget subrequest-nya fresh. (Cron nggak dipakai: kuota Cron Trigger akun
+// free maks 5 dan udah kepakai worker lain.)
 const BC_BATCH = 30;
-const BC_JOB_KEY = 'bc:job';
+const BC_GAP_MS = 2000; // jeda antar batch
+
+function bcStub(env) {
+  if (!env.BC_DO) return null;
+  return env.BC_DO.get(env.BC_DO.idFromName('broadcast'));
+}
+
+async function bcCall(env, path, body) {
+  const stub = bcStub(env);
+  if (!stub) return null;
+  const res = await stub.fetch(`https://bc.internal${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json().catch(() => null);
+}
 
 // Error yang artinya chat-nya beneran mati (user blokir bot / akun dihapus),
 // bukan error sementara (flood limit, 5xx, jaringan). Cuma yang beginian yang
@@ -906,20 +923,8 @@ function fmtDur(ms) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-// Kirim satu batch job yang lagi jalan. Dipanggil dari tombol "Kirim" (batch
-// pertama, biar broadcast kecil kelar instan) & dari cron tiap ~2 menit.
-async function runBroadcastBatch(env) {
-  const job = await kvGetJson(env, BC_JOB_KEY, null);
-  if (!job || !Array.isArray(job.queue)) return;
-  const batch = job.queue.slice(0, BC_BATCH);
-  const rest = job.queue.slice(BC_BATCH);
-  if (!batch.length) {
-    if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
-    return finishBroadcast(env, job);
-  }
-  // Klaim batch DULU (tulis sisa queue sebelum ngirim) biar cron berikutnya
-  // nggak ngirim ulang batch yang sama.
-  await kvPutJson(env, BC_JOB_KEY, { ...job, queue: rest });
+// Kirim satu batch dari daftar yang dikasih. Dipakai di dalam alarm DO.
+async function sendBroadcastChunk(env, batch, job) {
   let ok = 0, fail = 0, retryBudget = 6;
   const dead = [];
   for (const cid of batch) {
@@ -937,25 +942,7 @@ async function runBroadcastBatch(env) {
     }
     await sleep(40); // ~25 pesan/detik, di bawah batas Telegram (30/detik)
   }
-  const state = {
-    ...job,
-    queue: rest,
-    ok: (job.ok || 0) + ok,
-    fail: (job.fail || 0) + fail,
-    dead: [...(job.dead || []), ...dead],
-  };
-  if (rest.length) {
-    await kvPutJson(env, BC_JOB_KEY, state);
-    await editMessage(env, job.admin, job.msgId, [
-      `📣 *Broadcast jalan...* ${state.ok + state.fail}/${job.total}`,
-      `✅ Terkirim: *${state.ok}*${state.fail ? `   ❌ Gagal: *${state.fail}*` : ''}`,
-      '',
-      `_Sisa ${rest.length} chat digilir otomatis tiap ~2 menit._`,
-    ].join('\n')).catch(() => {});
-    return;
-  }
-  if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
-  return finishBroadcast(env, state);
+  return { ok, fail, dead };
 }
 
 // Laporan akhir + bersihin chat yang mati.
@@ -981,6 +968,75 @@ async function finishBroadcast(env, state) {
     .catch(() => sendMessage(env, state.admin, out).catch(() => {}));
 }
 
+// Durable Object pengantre broadcast. Statenya strong-consistent (beda dari KV)
+// & tiap alarm jalan sebagai invocation terpisah, jadi batch berikutnya dapet
+// budget subrequest baru. Satu instance aja (idFromName('broadcast')).
+export class BcQueue {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    const job = await this.state.storage.get('job');
+    if (path === '/start') {
+      if (job) return Response.json({ ok: false, reason: 'busy', left: (job.queue || []).length });
+      const next = await request.json();
+      await this.state.storage.put('job', next);
+      await this.state.storage.setAlarm(Date.now() + 200);
+      return Response.json({ ok: true, total: next.total });
+    }
+    if (path === '/status') {
+      return Response.json(job ? { running: true, ...this.snapshot(job) } : { running: false });
+    }
+    if (path === '/stop') {
+      if (job) { await this.state.storage.delete('job'); await this.state.storage.deleteAlarm(); }
+      return Response.json(job ? { running: true, ...this.snapshot(job) } : { running: false });
+    }
+    return new Response('not found', { status: 404 });
+  }
+
+  snapshot(job) {
+    return { ok: job.ok || 0, fail: job.fail || 0, total: job.total || 0, left: (job.queue || []).length };
+  }
+
+  async alarm() {
+    const job = await this.state.storage.get('job');
+    if (!job || !Array.isArray(job.queue)) return;
+    const batch = job.queue.slice(0, BC_BATCH);
+    const rest = job.queue.slice(BC_BATCH);
+    // Klaim batch DULU. Kalau alarm gagal & di-retry Cloudflare, chat yang udah
+    // diklaim nggak kekirim dua kali.
+    await this.state.storage.put('job', { ...job, queue: rest });
+    const res = await sendBroadcastChunk(this.env, batch, job);
+    // Kalau di tengah batch adminnya nembak /bcstop, job-nya udah kehapus →
+    // jangan dibangunin lagi (alarm ini nggak ke-lock waktu nunggu fetch).
+    const still = await this.state.storage.get('job');
+    if (!still) return;
+    const state = {
+      ...job,
+      queue: rest,
+      ok: (job.ok || 0) + res.ok,
+      fail: (job.fail || 0) + res.fail,
+      dead: [...(job.dead || []), ...res.dead],
+    };
+    if (rest.length) {
+      await this.state.storage.put('job', state);
+      await this.state.storage.setAlarm(Date.now() + BC_GAP_MS);
+      await editMessage(this.env, job.admin, job.msgId, [
+        `📣 *Broadcast jalan...* ${state.ok + state.fail}/${job.total}`,
+        `✅ Terkirim: *${state.ok}*${state.fail ? `   ❌ Gagal: *${state.fail}*` : ''}`,
+        '',
+        `_Sisa ${rest.length} chat, lanjut otomatis._`,
+      ].join('\n')).catch(() => {});
+      return;
+    }
+    await this.state.storage.delete('job');
+    await finishBroadcast(this.env, state);
+  }
+}
+
 async function handleCallback(env, call, ctx) {
   const [action, key] = String(call.data || '').split('|');
   if (!action || !key) return answerCallback(env, call.id, 'Invalid data');
@@ -995,13 +1051,13 @@ async function handleCallback(env, call, ctx) {
     return answerCallback(env, call.id, 'Dibatalkan');
   }
   if (action !== 'bc_send') return answerCallback(env, call.id, 'Unknown action');
-  const running = await kvGetJson(env, BC_JOB_KEY, null);
-  if (running) return answerCallback(env, call.id, '⚠️ Masih ada broadcast jalan, tunggu kelar dulu.');
+  if (!bcStub(env)) return answerCallback(env, call.id, '⚠️ Broadcast queue (BC_DO) belum keikat, deploy ulang.');
   // Hapus pending duluan → kalau webhook Telegram ke-retry, nggak dobel kirim.
   if (env.BOT_KV) await env.BOT_KV.delete(pendingKey);
   const queue = (data.users || []).map(Number).filter(Number.isFinite);
-  await editMessage(env, call.message.chat.id, call.message.message_id, `📣 Mengirim broadcast ke ${queue.length} chat...`).catch(() => {});
-  await kvPutJson(env, BC_JOB_KEY, {
+  const status = `📣 Mengirim broadcast ke ${queue.length} chat...`;
+  await editMessage(env, call.message.chat.id, call.message.message_id, status).catch(() => {});
+  const started = await bcCall(env, '/start', {
     admin: call.message.chat.id,
     msgId: call.message.message_id,
     msg: data.msg,
@@ -1013,11 +1069,11 @@ async function handleCallback(env, call, ctx) {
     ok: 0, fail: 0, dead: [],
     startedAt: Date.now(),
   });
-  await answerCallback(env, call.id, 'Broadcast dimulai 🚀');
-  // Batch pertama langsung jalan biar broadcast kecil kelar instan.
-  if (ctx) ctx.waitUntil(runBroadcastBatch(env));
-  else await runBroadcastBatch(env);
-  return;
+  if (!started || started.ok === false) {
+    await editMessage(env, call.message.chat.id, call.message.message_id, `⚠️ Masih ada broadcast jalan (sisa ${(started && started.left) || '?'} chat). Tunggu kelar atau \`/bcstop\`.`).catch(() => {});
+    return answerCallback(env, call.id, '⚠️ Broadcast lain masih jalan.');
+  }
+  return answerCallback(env, call.id, 'Broadcast dimulai 🚀');
 }
 
 async function handleMessage(env, message) {
@@ -1080,11 +1136,5 @@ export default {
       console.error(e);
     }
     return new Response('OK');
-  },
-
-  // Cron: gilir sisa batch broadcast. Kalau nggak ada job jalan, cuma 1 KV read
-  // terus balik (nol write, jadi aman buat kuota KV free tier).
-  async scheduled(event, env, ctx) {
-    try { await runBroadcastBatch(env); } catch (e) { console.error(e); }
   },
 };
