@@ -1,6 +1,10 @@
 const DOMAIN_RE = /(?:https?:\/\/)?(?:www\.)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)/gi;
 const MAX_BULK = 25;
 
+// Watermark/footer brand di tiap hasil. Edit satu tempat ini kalau mau ganti handle.
+const WM = '\n\n➖➖➖➖➖➖➖\n🤖 @ICannDomainbot  ·  📢 @ParcivProduct';
+function withWm(text) { return `${text}${WM}`; }
+
 function tgUrl(env, method) {
   return `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
 }
@@ -12,7 +16,14 @@ async function tg(env, method, payload) {
     body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(data.description || `Telegram ${method} failed`);
+  if (!res.ok || data.ok === false) {
+    // Simpan status + retry_after di error-nya: dipakai broadcast buat bedain
+    // "user blokir bot" (permanen) vs error sementara (flood limit / 5xx).
+    const err = new Error(data.description || `Telegram ${method} failed`);
+    err.status = res.status;
+    err.retryAfter = Number((data.parameters || {}).retry_after) || 0;
+    throw err;
+  }
   return data.result;
 }
 
@@ -43,6 +54,24 @@ async function editMessage(env, chatId, messageId, text, extra = {}) {
 
 async function answerCallback(env, id, text) {
   try { await tg(env, 'answerCallbackQuery', { callback_query_id: id, text }); } catch (_) {}
+}
+
+// Kirim teks panjang: edit pesan status utk potongan pertama, sisanya jadi pesan lanjutan
+// (biar nggak kepotong limit ~4096 char Telegram). Split di batas baris.
+async function sendChunked(env, chatId, firstMsgId, text) {
+  const LIMIT = 3900;
+  if (text.length <= LIMIT) {
+    return editMessage(env, chatId, firstMsgId, text).catch(() => sendMessage(env, chatId, text));
+  }
+  const chunks = [];
+  let cur = '';
+  for (const ln of text.split('\n')) {
+    if (cur && (cur.length + 1 + ln.length) > LIMIT) { chunks.push(cur); cur = ln; }
+    else cur = cur ? `${cur}\n${ln}` : ln;
+  }
+  if (cur) chunks.push(cur);
+  await editMessage(env, chatId, firstMsgId, chunks[0]).catch(() => sendMessage(env, chatId, chunks[0]));
+  for (let i = 1; i < chunks.length; i++) await sendMessage(env, chatId, chunks[i]);
 }
 
 async function kvGetJson(env, key, fallback) {
@@ -187,6 +216,38 @@ async function resolveRdapUrl(env, domain) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Ulang request RDAP lewat proxy non-Cloudflare (Vercel) saat registry nge-WAF
+// IP Worker (403/451). Aktif cuma kalau RDAP_PROXY_URL + RDAP_PROXY_KEY diset.
+// Registry kayak gmoregistry (.shop) sering ngasih 429 ke IP proxy → retry backoff.
+async function rdapViaProxy(env, rdapUrl, maxRetries = 3) {
+  if (!env || !env.RDAP_PROXY_URL || !env.RDAP_PROXY_KEY) return null;
+  const base = env.RDAP_PROXY_URL;
+  const purl = `${base}${base.includes('?') ? '&' : '?'}url=${encodeURIComponent(rdapUrl)}`;
+  let lastCode = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let res;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      res = await fetch(purl, { headers: { accept: 'application/rdap+json, application/json', 'x-proxy-key': env.RDAP_PROXY_KEY }, signal: ctrl.signal });
+      clearTimeout(timer);
+    } catch (_) {
+      await sleep(Math.min(6000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    lastCode = res.status;
+    if (res.status === 200) return { code: 200, data: await res.json().catch(() => null), err: null };
+    if ([400, 404].includes(res.status)) return { code: res.status, data: null, err: null };
+    // Upstream registry rate-limit (429) / sesaat (5xx) → backoff & ulang.
+    if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+      await sleep(Math.min(4000, (2 ** attempt) * 1000 + 800));
+      continue;
+    }
+    return null; // proxy ikut gagal (blok lain) → caller lanjut ke fallback WHOIS
+  }
+  return null; // habis retry tetap 429/5xx → fallback WHOIS
+}
+
 async function rdapGet(env, domain, maxRetries = 3) {
   // UA browser lengkap: 'Mozilla/5.0' polos sering dianggap bot oleh WAF registry (403).
   const headers = {
@@ -210,8 +271,11 @@ async function rdapGet(env, domain, maxRetries = 3) {
     lastCode = res.status;
     if (res.status === 200) return { code: 200, data: await res.json().catch(() => null), err: null };
     if ([400, 404].includes(res.status)) return { code: res.status, data: null, err: null };
-    // 403/451: registry blokir (WAF/IP), biasanya permanen → langsung fallback, jangan buang waktu retry.
+    // 403/451: registry blokir range IP CF Worker (WAF). RDAP-nya sendiri 200 dari
+    // IP biasa → coba ulang lewat proxy non-CF (Vercel) kalau dikonfigurasi.
     if (res.status === 403 || res.status === 451) {
+      const viaProxy = await rdapViaProxy(env, url);
+      if (viaProxy) return viaProxy;
       return { code: res.status, data: null, err: `HTTP ${res.status} — registry memblokir request` };
     }
     // 429/5xx: rate-limit/sesaat → retry dgn backoff.
@@ -411,12 +475,169 @@ function parseWhoisjsonDetails(data) {
   };
 }
 
-// Rantai fallback saat RDAP diblokir: WhoisJSON dulu (ada boolean `registered`), lalu IP2WHOIS.
+// Query satu tipe DNS record via DoH Cloudflare (gratis, gak butuh key).
+const DOH_TYPE = { A: 1, NS: 2, CNAME: 5, SOA: 6, MX: 15, TXT: 16, AAAA: 28 };
+async function dohQuery(domain, type) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`, {
+      headers: { accept: 'application/dns-json' }, signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { status: -1, records: [] };
+    const data = await res.json().catch(() => null);
+    if (!data) return { status: -1, records: [] };
+    const want = DOH_TYPE[type];
+    const records = (data.Answer || []).filter(a => a.type === want).map(a => String(a.data || '').replace(/\.$/, '')).filter(Boolean);
+    return { status: data.Status, records };
+  } catch (_) { return { status: -1, records: [] }; }
+}
+
+// Ambil daftar NS via DoH. Balikin [] kalau NXDOMAIN / gagal.
+async function dohNameservers(domain) {
+  return (await dohQuery(domain, 'NS')).records;
+}
+
+// Lookup beberapa tipe record sekaligus (paralel) buat command /dns.
+async function dnsLookup(domain) {
+  const types = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'CAA', 'SOA'];
+  const res = await Promise.all(types.map(t => dohQuery(domain, t)));
+  const map = {};
+  types.forEach((t, i) => { map[t] = res[i]; });
+  return map;
+}
+
+function formatDnsResult(domain, map) {
+  const nx = Object.values(map).every(r => !r.records.length) && (map.A.status === 3 || map.NS.status === 3);
+  if (nx) return `🔎 **DNS LOOKUP**\n━━━━━━━━━━━━━━━━━━\n🌐 \`${domain}\`\n\n⚠️ Nggak ke-resolve (NXDOMAIN) — kemungkinan belum kedaftar / tanpa DNS aktif.`;
+  const line = (label, arr, max = 20) => {
+    if (!arr.length) return '';
+    const shown = arr.slice(0, max).map(v => `• \`${v.length > 120 ? v.slice(0, 120) + '…' : v}\``).join('\n');
+    const more = arr.length > max ? `\n_…+${arr.length - max} lagi_` : '';
+    return `\n**${label}:**\n${shown}${more}\n`;
+  };
+  let body = '';
+  body += line('A (IPv4)', map.A.records);
+  body += line('AAAA (IPv6)', map.AAAA.records);
+  body += line('CNAME', map.CNAME.records);
+  body += line('MX (mail)', map.MX.records);
+  body += line('NS (nameserver)', map.NS.records);
+  body += line('TXT', map.TXT.records);
+  body += line('CAA', map.CAA.records);
+  body += line('SOA', map.SOA.records, 1);
+  if (!body.trim()) body = '\n_(nggak ada record yang kebaca)_';
+  const empties = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'CAA'].filter(t => !map[t].records.length);
+  const foot = empties.length ? `\n_Kosong (disembunyiin): ${empties.join(', ')}_` : '';
+  return `🔎 **DNS LOOKUP**\n━━━━━━━━━━━━━━━━━━\n🌐 \`${domain}\`\n${body}${foot}`;
+}
+
+// Saran domain (AI) via domscan /v1/suggest + cek availability sekalian.
+async function domscanSuggest(keywords, key, tlds = 'com,net,io,co,id', limit = 15) {
+  try {
+    const q = `keywords=${encodeURIComponent(keywords)}&tlds=${encodeURIComponent(tlds)}&limit=${limit}&check=true`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    const res = await fetch(`https://domscan.net/v1/suggest?${q}`, {
+      headers: { accept: 'application/json', 'x-api-key': key }, signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    const data = await res.json().catch(() => null);
+    if (res.status !== 200 || !data) return { ok: false, err: (data && data.error && data.error.message) || `HTTP ${res.status}`, list: [] };
+    return { ok: true, err: null, list: Array.isArray(data.suggestions) ? data.suggestions : [] };
+  } catch (e) { return { ok: false, err: String((e && e.message) || e), list: [] }; }
+}
+
+function formatSuggest(keywords, list) {
+  if (!list.length) return `✨ **SARAN DOMAIN**\n━━━━━━━━━━━━━━━━━━\nKata kunci: \`${keywords}\`\n\n⚠️ Nggak ada saran yang muncul. Coba kata lain.`;
+  const avail = list.filter(s => s.available === true);
+  const taken = list.filter(s => s.available === false);
+  const fmt = arr => arr.slice(0, 15).map(s => `\`${s.domain}\`${s.score ? ` _(skor ${s.score})_` : ''}`).join('\n');
+  let out = `✨ **SARAN DOMAIN**\n━━━━━━━━━━━━━━━━━━\n🔑 Kata kunci: \`${keywords}\`\n`;
+  if (avail.length) out += `\n✅ **Tersedia (bisa dibeli):**\n${fmt(avail)}\n`;
+  if (taken.length) out += `\n❌ **Udah kepake:**\n${taken.slice(0, 8).map(s => `\`${s.domain}\``).join(', ')}\n`;
+  return out;
+}
+
+// ── Fallback #3: combo DomScan /v1/status (verdict) + DoH (nameserver) ──
+
+async function domscanStatus(domain, key, maxRetries = 2) {
+  let lastCode = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let res;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      res = await fetch(`https://domscan.net/v1/status?domain=${encodeURIComponent(domain)}`, {
+        headers: { accept: 'application/json', 'x-api-key': key }, signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+    } catch (_) {
+      await sleep(Math.min(4000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    lastCode = res.status;
+    const data = await res.json().catch(() => null);
+    if (res.status === 200 && data && Array.isArray(data.results) && data.results[0]) {
+      return { code: 200, data: data.results[0], err: null };
+    }
+    if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+      await sleep(Math.min(4000, (2 ** attempt) * 1000 + 500));
+      continue;
+    }
+    return { code: res.status, data: null, err: `DomScan HTTP ${res.status}` };
+  }
+  return { code: lastCode || 429, data: null, err: `DomScan gagal (HTTP ${lastCode || 429})` };
+}
+
+// Tebak registrar dari link RDAP registrar di proof.links (mis. rdap.markmonitor.com → Markmonitor).
+function registrarFromDomscanProof(proof) {
+  for (const l of (proof && proof.links) || []) {
+    if ((l.rel === 'about' || l.rel === 'related') && l.href) {
+      try {
+        const name = new URL(l.href).hostname.replace(/^rdap\./, '').split('.')[0];
+        if (name && name !== 'gmoregistry') return name.charAt(0).toUpperCase() + name.slice(1);
+      } catch (_) {}
+    }
+  }
+  return 'Tidak diketahui';
+}
+
+// `data` = hasil results[0] domscan + properti _ns (daftar NS dari DoH) yang ditempel di fallbackLookup.
+function parseDomscanDetails(data) {
+  const events = {};
+  for (const e of data.rdap_events || []) events[e.eventAction] = e.eventDate;
+  const ns = (data._ns || []).filter(Boolean).map(n => `• \`${n}\``).join('\n') || '-';
+  const status = (Array.isArray(data.registry_status) && data.registry_status.length)
+    ? data.registry_status.slice(0, 6).join(', ')
+    : (data.status || '-');
+  return {
+    registrar: registrarFromDomscanProof(data.proof),
+    dates: {
+      created: formatRdapDate(events.registration),
+      expired: formatRdapDate(events.expiration),
+      updated: formatRdapDate(events['last changed'] || events['last update of RDAP database']),
+    },
+    ns,
+    status,
+    handle: (data.proof && data.proof.handle) || '-',
+  };
+}
+
+// Rantai fallback saat RDAP diblokir: WhoisJSON → combo DomScan+DoH → IP2WHOIS.
 async function fallbackLookup(env, domain) {
   if (env && env.WHOISJSON_KEY) {
     const w = await whoisjsonGet(domain, env.WHOISJSON_KEY);
     if (w.code === 200 && w.data && typeof w.data.registered === 'boolean') {
       return { available: !w.data.registered, data: w.data, source: 'WHOISJSON' };
+    }
+  }
+  if (env && env.DOMSCAN_KEY) {
+    const s = await domscanStatus(domain, env.DOMSCAN_KEY);
+    if (s.code === 200 && s.data && typeof s.data.available === 'boolean') {
+      if (s.data.available) return { available: true, data: null, source: 'DOMSCAN' };
+      const ns = await dohNameservers(domain); // NS gratis via DoH, gak lewat registry
+      return { available: false, data: { ...s.data, _ns: ns }, source: 'DOMSCAN' };
     }
   }
   if (env && env.IP2WHOIS_KEY) {
@@ -452,6 +673,7 @@ async function checkOneDomain(env, domain, detailed = true) {
   if (code !== 200 || !data) return [`⚠️ \`${domain}\`\nRDAP error: ${err || `HTTP ${code}`}`, true];
   const x = source === 'IP2WHOIS' ? parseIp2whoisDetails(data)
     : source === 'WHOISJSON' ? parseWhoisjsonDetails(data)
+    : source === 'DOMSCAN' ? parseDomscanDetails(data)
     : parseRdapDetails(data);
   if (detailed) {
     return [`❌ **DOMAIN SUDAH TERDAFTAR**\n━━━━━━━━━━━━━━━━━━\n🌐 **Domain:** \`${domain}\`\n🆔 **Handle:** \`${x.handle}\`\n\n🏢 **Registrar:**\n${x.registrar}\n\n📅 **Tanggal:**\nRegister: \`${x.dates.created}\`\nExpired : \`${x.dates.expired}\`\nUpdated : \`${x.dates.updated}\`\n\n🔒 **Status:**\n${x.status}\n\n📡 **Name Servers:**\n${x.ns}`, false];
@@ -497,12 +719,57 @@ async function handleRestoreDocument(env, message) {
   }
 }
 
+const MENU_BTN = '📋 Command';
+function mainKeyboard() {
+  return {
+    keyboard: [[MENU_BTN]],
+    resize_keyboard: true,
+    input_field_placeholder: 'Ketik domain / tap Command…',
+  };
+}
+
+const HELP_TEXT = [
+  '🤖 **Domain Lookup Bot**',
+  '━━━━━━━━━━━━━━━━━━',
+  'Kirim **domain** langsung buat cek terdaftar/available (RDAP).',
+  'Bisa bulk — pisah pakai spasi / enter / koma (maks 25).',
+  '',
+  '📋 **Perintah:**',
+  '• `<domain>` — cek status domain',
+  '• `/dns <domain>` — lihat record DNS (A, MX, NS, TXT, dll)',
+  '• `/suggest <kata>` — saran nama domain yang masih tersedia',
+  '• `/ip <alamat_ip>` — cek lokasi IP',
+  '• `/myid` — lihat ID Telegram kamu',
+  '• `/menu` — munculin tombol menu',
+  '',
+  'Contoh: `google.com`  •  `/dns google.com`  •  `/suggest kopi kekinian`',
+].join('\n');
+
 async function handleCommand(env, message, text) {
   const cmd = text.split(/\s+/, 1)[0].toLowerCase();
-  if (cmd === '/start' || cmd === '/help') {
-    return reply(env, message, 'Kirim domain untuk cek via RDAP (ICANN-style).\nBisa bulk (pisah spasi/enter/koma).\n\nContoh:\n`google.com\nopenai.com, example.net\nbadras.biz.id`\n\n🌍 Cek lokasi IP: `/ip <alamat_ip>`\nContoh: `/ip 8.8.8.8`');
+  if (cmd === '/start' || cmd === '/help' || cmd === '/menu') {
+    return reply(env, message, withWm(HELP_TEXT), { reply_markup: mainKeyboard() });
   }
   if (cmd === '/myid') return reply(env, message, `🆔 ID kamu: \`${message.from.id}\`\n💬 Chat ID: \`${message.chat.id}\``);
+  if (cmd === '/dns') {
+    const arg = (text.split(/\s+/)[1] || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!arg) return reply(env, message, 'Format: `/dns <domain>`\nContoh: `/dns google.com`');
+    if (!isValidDomain(arg)) return reply(env, message, '❌ Format domain salah. Contoh: `/dns google.com`');
+    const status = await reply(env, message, '🔍 Ngambil record DNS...');
+    const map = await dnsLookup(arg);
+    const out = withWm(formatDnsResult(arg, map));
+    return sendChunked(env, message.chat.id, status.message_id, out);
+  }
+  if (cmd === '/suggest' || cmd === '/sugest') {
+    if (!env.DOMSCAN_KEY) return reply(env, message, '⚠️ Fitur saran domain belum aktif.');
+    const raw = text.replace(/^\/sugg?est\s*/i, '').trim();
+    if (!raw) return reply(env, message, 'Format: `/suggest <kata kunci>`\nContoh: `/suggest kopi kekinian`');
+    const keywords = raw.split(/[\s,]+/).filter(Boolean).slice(0, 10).join(',');
+    const status = await reply(env, message, '✨ Nyari saran domain...');
+    const { ok, err, list } = await domscanSuggest(keywords, env.DOMSCAN_KEY);
+    const out = withWm(ok ? formatSuggest(keywords.replace(/,/g, ', '), list) : `⚠️ Gagal ambil saran: ${err}`);
+    return editMessage(env, message.chat.id, status.message_id, out).catch(() => sendMessage(env, message.chat.id, out));
+  }
   if (cmd === '/ip') {
     const ip = (text.split(/\s+/)[1] || '').trim();
     if (!ip) return reply(env, message, 'Format: /ip <alamat_ip>\nContoh: `/ip 8.8.8.8`');
@@ -511,7 +778,7 @@ async function handleCommand(env, message, text) {
     if (!key) return reply(env, message, '⚠️ Fitur IP lookup belum aktif (API key belum diset).');
     const status = await reply(env, message, '🔍 Mencari lokasi IP...');
     const { code, data, err } = await ip2locationGet(ip, key);
-    const out = (code === 200 && data) ? formatIpInfo(ip, data) : `⚠️ Gagal lookup IP \`${ip}\`\n${err || `HTTP ${code}`}`;
+    const out = withWm((code === 200 && data) ? formatIpInfo(ip, data) : `⚠️ Gagal lookup IP \`${ip}\`\n${err || `HTTP ${code}`}`);
     return editMessage(env, message.chat.id, status.message_id, out).catch(() => sendMessage(env, message.chat.id, out));
   }
   if (cmd === '/setadmin') {
@@ -554,7 +821,17 @@ async function handleCommand(env, message, text) {
   if (cmd === '/restore') return beginRestore(env, message);
   if (cmd === '/stats') {
     const users = await getUsers(env), admins = await getAdmins(env);
-    return reply(env, message, `📊 Stats\n\n👥 Users tersimpan: ${users.length}\n👑 Admin: ${admins.length}`);
+    const job = await kvGetJson(env, BC_JOB_KEY, null);
+    const bc = job
+      ? `\n\n📣 Broadcast jalan: ${(job.ok || 0) + (job.fail || 0)}/${job.total}\n✅ ${job.ok || 0}  ❌ ${job.fail || 0}  ⏭ sisa ${(job.queue || []).length}\nStop pakai \`/bcstop\``
+      : '';
+    return reply(env, message, `📊 Stats\n\n👥 Users tersimpan: ${users.length}\n👑 Admin: ${admins.length}${bc}`);
+  }
+  if (cmd === '/bcstop') {
+    const job = await kvGetJson(env, BC_JOB_KEY, null);
+    if (!job) return reply(env, message, 'Nggak ada broadcast yang jalan.');
+    if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
+    return reply(env, message, `🛑 Broadcast dihentikan.\n✅ Terkirim: *${job.ok || 0}*\n❌ Gagal: *${job.fail || 0}*\n⏭ Sisa dibatalkan: *${(job.queue || []).length}*`);
   }
   if (cmd === '/bc') {
     const msg = text.replace(/^\/bc\s*/i, '').trim();
@@ -590,7 +867,121 @@ async function handleCommand(env, message, text) {
   }
 }
 
-async function handleCallback(env, call) {
+// ── Broadcast bertahap ─────────────────────────────────────────────────────
+// Worker free plan cuma boleh ~50 subrequest per invocation, jadi broadcast ke
+// banyak chat nggak aman dikirim sekali jalan (mentok di tengah, dan sisanya
+// dulu malah kehapus dari daftar user). Sekarang dipecah per batch: batch
+// pertama jalan langsung pas tombol Kirim ditekan, sisanya digilir cron.
+const BC_BATCH = 30;
+const BC_JOB_KEY = 'bc:job';
+
+// Error yang artinya chat-nya beneran mati (user blokir bot / akun dihapus),
+// bukan error sementara (flood limit, 5xx, jaringan). Cuma yang beginian yang
+// boleh dicopot dari daftar user.
+function isDeadRecipientError(err) {
+  const st = Number(err && err.status) || 0;
+  const msg = String((err && err.message) || err || '');
+  if (st && st !== 400 && st !== 403) return false;
+  return /bot was blocked|blocked by the user|user is deactivated|user is deleted|chat not found|bot was kicked|PEER_ID_INVALID/i.test(msg);
+}
+
+// Kirim satu pesan broadcast sesuai jenis job: teks, foto+caption, atau copy pesan.
+async function sendBroadcastTo(env, cid, job) {
+  if (job.photo) {
+    return tg(env, 'sendPhoto', {
+      chat_id: cid,
+      photo: job.photo,
+      caption: job.msg || undefined,
+      caption_entities: (job.entities && job.entities.length) ? job.entities : undefined,
+    });
+  }
+  if (job.copyFrom) {
+    return tg(env, 'copyMessage', { chat_id: cid, from_chat_id: job.copyFrom.chat_id, message_id: job.copyFrom.message_id });
+  }
+  return sendMessage(env, cid, job.msg, { parse_mode: undefined });
+}
+
+function fmtDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// Kirim satu batch job yang lagi jalan. Dipanggil dari tombol "Kirim" (batch
+// pertama, biar broadcast kecil kelar instan) & dari cron tiap ~2 menit.
+async function runBroadcastBatch(env) {
+  const job = await kvGetJson(env, BC_JOB_KEY, null);
+  if (!job || !Array.isArray(job.queue)) return;
+  const batch = job.queue.slice(0, BC_BATCH);
+  const rest = job.queue.slice(BC_BATCH);
+  if (!batch.length) {
+    if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
+    return finishBroadcast(env, job);
+  }
+  // Klaim batch DULU (tulis sisa queue sebelum ngirim) biar cron berikutnya
+  // nggak ngirim ulang batch yang sama.
+  await kvPutJson(env, BC_JOB_KEY, { ...job, queue: rest });
+  let ok = 0, fail = 0, retryBudget = 6;
+  const dead = [];
+  for (const cid of batch) {
+    let retried = false;
+    for (;;) {
+      try { await sendBroadcastTo(env, cid, job); ok++; break; }
+      catch (err) {
+        // Kena flood limit → tunggu sesuai saran Telegram, coba sekali lagi.
+        const ra = Number(err && err.retryAfter) || 0;
+        if (ra > 0 && ra <= 8 && !retried && retryBudget > 0) { retried = true; retryBudget--; await sleep((ra + 1) * 1000); continue; }
+        fail++;
+        if (isDeadRecipientError(err)) dead.push(Number(cid));
+        break;
+      }
+    }
+    await sleep(40); // ~25 pesan/detik, di bawah batas Telegram (30/detik)
+  }
+  const state = {
+    ...job,
+    queue: rest,
+    ok: (job.ok || 0) + ok,
+    fail: (job.fail || 0) + fail,
+    dead: [...(job.dead || []), ...dead],
+  };
+  if (rest.length) {
+    await kvPutJson(env, BC_JOB_KEY, state);
+    await editMessage(env, job.admin, job.msgId, [
+      `📣 *Broadcast jalan...* ${state.ok + state.fail}/${job.total}`,
+      `✅ Terkirim: *${state.ok}*${state.fail ? `   ❌ Gagal: *${state.fail}*` : ''}`,
+      '',
+      `_Sisa ${rest.length} chat digilir otomatis tiap ~2 menit._`,
+    ].join('\n')).catch(() => {});
+    return;
+  }
+  if (env.BOT_KV) await env.BOT_KV.delete(BC_JOB_KEY);
+  return finishBroadcast(env, state);
+}
+
+// Laporan akhir + bersihin chat yang mati.
+async function finishBroadcast(env, state) {
+  const deadSet = new Set((state.dead || []).map(Number));
+  let removed = 0;
+  if (deadSet.size) {
+    const users = await getUsers(env);
+    const keep = users.filter(u => !deadSet.has(Number(u)));
+    removed = users.length - keep.length;
+    if (removed) { await putUsers(env, keep); await sendBackup(env, 'remove_user'); }
+  }
+  const ok = state.ok || 0, fail = state.fail || 0;
+  const out = [
+    '📢 *Broadcast selesai.*',
+    `✅ Terkirim: *${ok}*`,
+    fail ? `❌ Gagal: *${fail}*` : '',
+    deadSet.size ? `🚫 Blokir bot: *${deadSet.size}*` : '',
+    removed ? `🧹 Chat mati dihapus: *${removed}*` : '',
+    `👥 Target: *${state.total || ok + fail}*  ·  ⏱ ${fmtDur(Date.now() - (state.startedAt || Date.now()))}`,
+  ].filter(Boolean).join('\n');
+  await editMessage(env, state.admin, state.msgId, out)
+    .catch(() => sendMessage(env, state.admin, out).catch(() => {}));
+}
+
+async function handleCallback(env, call, ctx) {
   const [action, key] = String(call.data || '').split('|');
   if (!action || !key) return answerCallback(env, call.id, 'Invalid data');
   const adminId = Number(key.split(':')[0]);
@@ -604,28 +995,29 @@ async function handleCallback(env, call) {
     return answerCallback(env, call.id, 'Dibatalkan');
   }
   if (action !== 'bc_send') return answerCallback(env, call.id, 'Unknown action');
-  await editMessage(env, call.message.chat.id, call.message.message_id, `📣 Mengirim broadcast ke ${data.users.length} chat...`).catch(() => {});
-  let ok = 0, fail = 0;
-  for (const cid of data.users || []) {
-    try {
-      if (data.photo) {
-        await tg(env, 'sendPhoto', {
-          chat_id: cid, photo: data.photo,
-          caption: data.msg || undefined,
-          caption_entities: (data.entities && data.entities.length) ? data.entities : undefined,
-        });
-      } else if (data.copyFrom) {
-        await tg(env, 'copyMessage', { chat_id: cid, from_chat_id: data.copyFrom.chat_id, message_id: data.copyFrom.message_id });
-      } else {
-        await sendMessage(env, cid, data.msg, { parse_mode: undefined });
-      }
-      ok++;
-    } catch (_) { fail++; const users = (await getUsers(env)).filter(u => u !== Number(cid)); await putUsers(env, users); }
-  }
-  if (fail) await sendBackup(env, 'remove_user');
+  const running = await kvGetJson(env, BC_JOB_KEY, null);
+  if (running) return answerCallback(env, call.id, '⚠️ Masih ada broadcast jalan, tunggu kelar dulu.');
+  // Hapus pending duluan → kalau webhook Telegram ke-retry, nggak dobel kirim.
   if (env.BOT_KV) await env.BOT_KV.delete(pendingKey);
-  await editMessage(env, call.message.chat.id, call.message.message_id, `✅ Broadcast selesai.\nTerkirim: ${ok}\nGagal: ${fail}`).catch(() => {});
-  return answerCallback(env, call.id, 'Selesai ✅');
+  const queue = (data.users || []).map(Number).filter(Number.isFinite);
+  await editMessage(env, call.message.chat.id, call.message.message_id, `📣 Mengirim broadcast ke ${queue.length} chat...`).catch(() => {});
+  await kvPutJson(env, BC_JOB_KEY, {
+    admin: call.message.chat.id,
+    msgId: call.message.message_id,
+    msg: data.msg,
+    photo: data.photo,
+    entities: data.entities,
+    copyFrom: data.copyFrom,
+    queue,
+    total: queue.length,
+    ok: 0, fail: 0, dead: [],
+    startedAt: Date.now(),
+  });
+  await answerCallback(env, call.id, 'Broadcast dimulai 🚀');
+  // Batch pertama langsung jalan biar broadcast kecil kelar instan.
+  if (ctx) ctx.waitUntil(runBroadcastBatch(env));
+  else await runBroadcastBatch(env);
+  return;
 }
 
 async function handleMessage(env, message) {
@@ -640,6 +1032,8 @@ async function handleMessage(env, message) {
   const cmdSource = text.startsWith('/') ? text : (caption.startsWith('/') ? caption : '');
   if (cmdSource) return handleCommand(env, message, cmdSource);
   if (!text) return;
+  // Tombol menu "📋 Command" → tampilin daftar perintah.
+  if (text === MENU_BTN) return reply(env, message, withWm(HELP_TEXT), { reply_markup: mainKeyboard() });
   let domains = extractDomains(text);
   if (!domains.length) return reply(env, message, 'Format domain salah. Contoh: `interhost.ltd`');
   if (domains.length > MAX_BULK) {
@@ -651,7 +1045,8 @@ async function handleMessage(env, message) {
     if (!isValidDomain(d)) return reply(env, message, 'Format domain salah.');
     const status = await reply(env, message, '🔍 Checking via RDAP...');
     const [out] = await checkOneDomain(env, d, true);
-    return editMessage(env, message.chat.id, status.message_id, out).catch(() => sendMessage(env, message.chat.id, out));
+    const msg = withWm(out);
+    return editMessage(env, message.chat.id, status.message_id, msg).catch(() => sendMessage(env, message.chat.id, msg));
   }
   const status = await reply(env, message, `🔍 Memproses **${domains.length}** domain via RDAP...`);
   const results = [];
@@ -665,24 +1060,31 @@ async function handleMessage(env, message) {
     results.push(line);
     await sleep(250);
   }
-  let finalText = `✅ **Selesai** — Total: **${domains.length}** | Error: **${errc}**\n\n` + results.join('\n\n');
-  if (finalText.length > 3900) finalText = finalText.slice(0, 3800) + '\n\n…(dipotong limit Telegram)';
+  let body = `✅ **Selesai** — Total: **${domains.length}** | Error: **${errc}**\n\n` + results.join('\n\n');
+  if (body.length > 3800) body = body.slice(0, 3700) + '\n\n…(dipotong limit Telegram)';
+  const finalText = withWm(body);
   return editMessage(env, message.chat.id, status.message_id, finalText).catch(() => sendMessage(env, message.chat.id, finalText));
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'GET') return new Response('domain_lookup worker OK');
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
     if (!env.BOT_TOKEN) return new Response('Missing BOT_TOKEN', { status: 500 });
     const update = await request.json().catch(() => null);
     if (!update) return new Response('Bad Request', { status: 400 });
     try {
-      if (update.callback_query) await handleCallback(env, update.callback_query);
+      if (update.callback_query) await handleCallback(env, update.callback_query, ctx);
       else if (update.message) await handleMessage(env, update.message);
     } catch (e) {
       console.error(e);
     }
     return new Response('OK');
+  },
+
+  // Cron: gilir sisa batch broadcast. Kalau nggak ada job jalan, cuma 1 KV read
+  // terus balik (nol write, jadi aman buat kuota KV free tier).
+  async scheduled(event, env, ctx) {
+    try { await runBroadcastBatch(env); } catch (e) { console.error(e); }
   },
 };

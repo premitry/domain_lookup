@@ -2,6 +2,11 @@ name = "domain-lookup-bot"
 main = "worker.js"
 compatibility_date = "2026-05-09"
 
+# Cron buat nggilir sisa batch broadcast (batas subrequest Worker free plan).
+# Idle = cuma 1 KV read per tick, nggak makan kuota write.
+[triggers]
+crons = ["*/2 * * * *"]
+
 # Buat KV dulu:
 # wrangler kv namespace create BOT_KV
 # Lalu isi id hasilnya di bawah ini.
